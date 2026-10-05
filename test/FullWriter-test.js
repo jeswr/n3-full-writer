@@ -530,60 +530,53 @@ describe('A FullWriter writing N3 formulas', () => {
       '<urn:p> <urn:p> <<(?x <urn:p> <urn:a>)>>, <<(<?x> <urn:p> <urn:a>)>> }.\n');
   });
 
-  it('should end only after the formulas were written to an asynchronous stream', async () => {
-    const p = new NamedNode('urn:p'), f = new BlankNode('f'), formulas = { f: [] };
+  it('should refuse a quoted triple that contains itself', async () => {
+    const p = new NamedNode('urn:p'), f = new BlankNode('f');
+    const cyclic = { termType: 'Quad', value: '', subject: p, predicate: p, graph: new DefaultGraph() };
+    cyclic.object = cyclic;
+    const message = 'Cannot write quoted triples nested more than 256 levels deep once formulas are in use';
+    for (const formulas of [{ f: [new Quad(p, p, cyclic)] }, { f: [new Quad(p, p, new BlankNode('g'))], g: [cyclic] }]) {
+      const writer = new FullWriter({ format: 'N3', formulas });
+      writer.addQuad(p, p, f);
+      await expect(end(writer)).rejects.toThrow(message);
+    }
+    expect(() => new FullWriter({ format: 'N3', formulas: {} }).addQuad(cyclic)).toThrow(message);
+  });
+
+  it('should throw formulas that cannot be written from end without a callback', () => {
+    const p = new NamedNode('urn:p'), f = new BlankNode('f');
+    const writer = new FullWriter({ format: 'N3', formulas: { f: [new Quad(p, p, f)] } });
+    writer.addQuad(p, p, f);
+    expect(() => writer.end()).toThrow('Cannot write formula _:f inside itself');
+    expect(() => writer.end()).toThrow('Cannot write formula _:f inside itself');
+  });
+
+  it('should report formulas that cannot be written when the output stream fails while closing', async () => {
+    const p = new NamedNode('urn:p'), f = new BlankNode('f'), message = 'Cannot write formula _:f inside itself';
     for (const options of [{}, { end: false }]) {
-      const callbacks = [], events = [];
-      const stream = { write(chunk, encoding, done) { events.push('write'); done && callbacks.push(done); },
-        end(done) { events.push('end'); done(); } };
-      const writer = new FullWriter(stream, { format: 'N3', formulas, ...options });
+      const chunks = [];
+      const stream = {
+        ended: false,
+        write(chunk, encoding, done) {
+          if (chunk === '.\n')
+            throw new Error('write');
+          chunks.push(chunk);
+          done && done();
+        },
+        end() { stream.ended = true; throw new Error('end'); },
+      };
+      const writer = new FullWriter(stream, { format: 'N3', formulas: { f: [new Quad(p, p, f)] }, ...options });
+      writer.addQuad(p, p, p);
       writer.addQuad(p, p, f);
       const done = jest.fn();
       writer.end(done);
-      expect(done).not.toHaveBeenCalled();
-      callbacks.forEach(callback => callback());
-      callbacks.forEach(callback => callback());
       expect(done).toHaveBeenCalledTimes(1);
-      expect(done.mock.calls[0][0]).toBeNull();
-      expect(events).toEqual(options.end === false ? ['write'] : ['write', 'end']);
+      expect(done).toHaveBeenCalledWith(new Error(message));
+      expect(stream.ended).toBe(options.end !== false);
+      let error;
+      writer.addQuad(p, p, p, new DefaultGraph(), e => { error = e; });
+      expect(error).toEqual(new Error('Cannot write because the writer has been closed.'));
+      expect(chunks).toEqual(['<urn:p> <urn:p> <urn:p>']);
     }
-  });
-
-  it('should report errors of the output stream when ending', async () => {
-    const p = new NamedNode('urn:p'), f = new BlankNode('f'), formulas = { f: [] };
-    const failing = (write, endStream) => {
-      const stream = { ended: 0, write, end(done) { stream.ended++; endStream && endStream(done); } };
-      return stream;
-    };
-    // An asynchronous write error
-    let stream = failing((chunk, encoding, done) => done && done(new Error('write')));
-    let writer = new FullWriter(stream, { format: 'N3', formulas });
-    writer.addQuad(p, p, f);
-    await expect(end(writer)).rejects.toThrow('write');
-    await expect(end(writer)).rejects.toThrow('write');
-    expect(stream.ended).toBe(1);
-    // A synchronous write error
-    stream = failing(() => { throw new Error('thrown'); });
-    writer = new FullWriter(stream, { format: 'N3', formulas });
-    writer.addQuad(p, p, f);
-    expect(() => writer.end()).toThrow('thrown');
-    // An error ending the stream, thrown or passed to its callback
-    for (const endStream of [() => { throw new Error('end'); }, done => done(new Error('end')),
-      done => { done(new Error('end')); done(); }]) {
-      stream = failing((chunk, encoding, done) => done && done(), endStream);
-      writer = new FullWriter(stream, { format: 'N3', formulas });
-      writer.addQuad(p, p, f);
-      await expect(end(writer)).rejects.toThrow('end');
-      expect(stream.ended).toBe(1);
-    }
-    // Without formulas
-    stream = failing(() => {}, () => { throw new Error('end'); });
-    await expect(end(new FullWriter(stream))).rejects.toThrow('end');
-    const open = new FullWriter(failing(() => {}), { end: false });
-    expect(await end(open)).toBeUndefined();
-    // An error thrown by the callback itself
-    writer = new FullWriter({ format: 'N3', formulas });
-    writer.addQuad(p, p, f);
-    expect(() => writer.end(() => { throw new Error('callback'); })).toThrow('callback');
   });
 });

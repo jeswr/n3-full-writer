@@ -89,10 +89,11 @@ Statements are checked when they are added. Errors in formulas themselves only s
 when statements without formulas may already have been written to the output.
 The callback of a statement with formulas only acknowledges that the statement was held back.
 
-`end(done)` calls `done` once the formulas were written and the output stream ended,
-or with the first error, which includes errors of the output stream.
-Without `done`, `end()` throws errors it meets synchronously.
-After a failed `end()`, the writer stays closed and reports the same error on later calls.
+`end()` writes the held-back statements and then behaves exactly like `N3.Writer#end`,
+including how it reports errors of the output stream.
+Formulas that cannot be written are reported before any of them is written:
+to the `end` callback, or thrown without one.
+The writer is then closed, and reports the same error on later calls to `end()`.
 
 ## Development
 
