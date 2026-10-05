@@ -3,5 +3,4 @@
 declare module 'n3' {
   export const Term: unknown;
   export const Writer: unknown;
-  export const termToId: unknown;
 }

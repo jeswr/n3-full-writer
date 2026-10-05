@@ -13,12 +13,14 @@ This code was proposed for N3.js in
 [rdfjs/N3.js#822](https://github.com/rdfjs/N3.js/pull/822),
 and lives here while its design settles.
 It is experimental: it overrides private N3.js Writer methods,
-so run the tests when updating the `n3` dependency.
+so it supports only the `n3` versions in its `peerDependencies`,
+and refuses to load if the members it relies on are missing.
+It extends `N3.Writer` only, so it does not work through `N3.StreamWriter`.
 
 ## Install
 
 ```sh
-npm install n3-full-writer
+npm install n3 n3-full-writer
 ```
 
 The package is written in TypeScript and ships its type declarations.
@@ -48,7 +50,9 @@ writer.end((error, result) => console.log(result));
 ```
 
 The N3.js parser puts the quads of a formula in a graph named by the formula's blank node,
-so a parsed document is written back by grouping its quads by graph:
+so a parsed document is written back by grouping its quads by graph.
+An empty formula `{}` has no quads, so it is not found this way;
+give the labels of known empty formulas an empty array.
 
 ```js
 const formulas = {}, statements = [];
@@ -71,14 +75,23 @@ writer.end((error, result) => console.log(result));
   with inverse `is … of` verbs where it is the object.
 - Blank nodes in the scope of one formula only, as N3 scopes blank node labels to their formula.
 
-It refuses, with an error, what it cannot write faithfully:
+Any `formulas` option, even `{}`, turns on these restrictions.
+The writer refuses, with an error, what it cannot write faithfully:
 
 - formats other than N3, and the `lists` option (write lists as `rdf:first` and `rdf:rest` statements);
-- named graphs, and nodes from `blank()` or `list()`, once formulas are in use;
+- named graphs, and nodes from `blank()` or `list()` or anything else that is not an RDF/JS term;
+- quoted triples nested more than 256 levels deep;
 - a formula inside itself, or a formula that would have to be written more than once;
 - a blank node used both inside and outside a formula;
-- rebinding a prefix after a statement with formulas was added.
+- rebinding a prefix to another IRI.
 
+Statements are checked when they are added. Errors in formulas themselves only show at `end()`,
+when statements without formulas may already have been written to the output.
+The callback of a statement with formulas only acknowledges that the statement was held back.
+
+`end(done)` calls `done` once the formulas were written and the output stream ended,
+or with the first error, which includes errors of the output stream.
+Without `done`, `end()` throws errors it meets synchronously.
 After a failed `end()`, the writer stays closed and reports the same error on later calls.
 
 ## Development

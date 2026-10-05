@@ -10,6 +10,11 @@ updates:
     directory: "/" # Location of package manifests
     schedule:
       interval: "weekly"
+    # Dependency updates release a patch; development dependency updates release nothing
+    commit-message:
+      prefix: "fix"
+      prefix-development: "chore"
+      include: "scope"
     groups:
       minor:
         update-types:

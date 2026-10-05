@@ -27,14 +27,15 @@ jobs:
       # Pinned to a commit SHA: the action lives outside the actions/* org.
       - uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
         id: metadata
-      # This package builds on N3 internals, so major updates get a human review.
+      # This package builds on N3 internals, so only minor and patch updates merge on their own;
+      # major and unclassified updates get a human review.
       - name: Auto-approve
-        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        if: contains(fromJSON('["version-update:semver-minor","version-update:semver-patch"]'), steps.metadata.outputs.update-type)
         run: gh pr review "$PR_URL" --approve
         env:
           GH_TOKEN: ${{ github.token }}
       - name: Enable auto-merge
-        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        if: contains(fromJSON('["version-update:semver-minor","version-update:semver-patch"]'), steps.metadata.outputs.update-type)
         # Merging with GITHUB_TOKEN would not trigger CI on main, so releases would
         # never run for dependency updates; use a PAT or GitHub App token.
         # Set this Actions secret to a fine-grained PAT scoped to this repo with

@@ -442,20 +442,16 @@ describe('A FullWriter writing N3 formulas', () => {
     expect(writer.quadToString(p, p, p)).toBe('<urn:p> <urn:p> <urn:p> .\n');
   });
 
-  it('should refuse to rebind a prefix after statements with formulas', async () => {
+  it('should refuse to rebind a prefix once formulas are in use', async () => {
     const p = new NamedNode('urn:old:p'), f = new BlankNode('f');
     const writer = new FullWriter({ format: 'N3', prefixes: { ex: 'urn:old:' }, formulas: { f: [new Quad(p, p, p)] } });
-    writer.addPrefix('ex', 'urn:other:');
-    writer.addPrefix('ex', 'urn:old:');
-    writer.addQuad(p, p, f);
-    const message = 'Cannot rebind prefix ex: after writing statements with formulas';
+    const message = 'Cannot rebind prefix ex: once formulas are in use';
     expect(() => writer.addPrefix('ex', 'urn:new:')).toThrow(message);
     expect(() => writer.addPrefixes({ ex: new NamedNode('urn:new:') })).toThrow(message);
     writer.addPrefix('ex', 'urn:old:');
     writer.addPrefix('alias', 'urn:old:');
-    writer.addPrefix('other', 'urn:other:');
-    expect(await end(writer)).toBe('@prefix ex: <urn:old:>.\n\n@prefix ex: <urn:other:>.\n\n@prefix ex: <urn:old:>.\n\n' +
-      '@prefix ex: <urn:old:>.\n\n@prefix alias: <urn:old:>.\n\n@prefix other: <urn:other:>.\n\n' +
+    writer.addQuad(p, p, f);
+    expect(await end(writer)).toBe('@prefix ex: <urn:old:>.\n\n@prefix ex: <urn:old:>.\n\n@prefix alias: <urn:old:>.\n\n' +
       'alias:p alias:p { alias:p alias:p alias:p }.\n');
   });
 
@@ -469,7 +465,7 @@ describe('A FullWriter writing N3 formulas', () => {
     let error;
     writer.addQuad(p, p, p, new DefaultGraph(), e => { error = e; });
     expect(error).toEqual(new Error('Cannot write because the writer has been closed.'));
-    writer.end();
+    expect(() => writer.end()).toThrow(message);
     for (const options of [{}, { end: false }]) {
       const chunks = [];
       const stream = { ended: false, write(chunk, encoding, done) { chunks.push(chunk); done && done(); } };
@@ -499,5 +495,95 @@ describe('A FullWriter writing N3 formulas', () => {
     const p = new NamedNode('urn:p'), writer = new FullWriter();
     writer.addQuad(writer.blank(p, p), p, writer.list([p]));
     expect(await end(writer)).toBe('[ <urn:p> <urn:p> ] <urn:p> (<urn:p>).\n');
+  });
+
+  it('should refuse terms without an RDF/JS term type, such as nodes from another copy of N3.js', () => {
+    const p = new NamedNode('urn:p'), message = 'Cannot use nodes created by blank() or list() once formulas are in use';
+    const writer = new FullWriter({ format: 'N3', formulas: { f: [] } }), node = { id: '[]', value: '[]' };
+    expect(() => writer.addQuad(node, p, p)).toThrow(message);
+    expect(() => writer.addQuad(p, p, { subject: p, predicate: p, object: p, termType: 'Quad' })).toThrow(message);
+  });
+
+  it('should limit the nesting of quoted triples', async () => {
+    const p = new NamedNode('urn:p'), f = new BlankNode('f');
+    let term = p;
+    for (let i = 0; i < 256; i++)
+      term = new Quad(p, p, term);
+    const writer = new FullWriter({ format: 'N3', formulas: { f: [new Quad(p, p, term)] } });
+    writer.addQuad(term, p, f);
+    expect(await end(writer)).toMatch(/^<<\(/);
+    const message = 'Cannot write quoted triples nested more than 256 levels deep once formulas are in use';
+    const deeper = new Quad(p, p, term);
+    expect(() => new FullWriter({ format: 'N3', formulas: { f: [] } }).addQuad(deeper, p, f)).toThrow(message);
+    const nested = new FullWriter({ format: 'N3', formulas: { f: [new Quad(p, p, deeper)] } });
+    nested.addQuad(p, p, f);
+    await expect(end(nested)).rejects.toThrow(message);
+  });
+
+  it('should tell terms apart by type when grouping statements', async () => {
+    const [p, a, b] = ['p', 'a', 'b'].map(name => new NamedNode(`urn:${name}`));
+    const formulas = { f: [new Quad(new Variable('x'), p, a), new Quad(new NamedNode('?x'), p, b),
+      new Quad(p, p, new Quad(new Variable('x'), p, a)), new Quad(p, p, new Quad(new NamedNode('?x'), p, a))] };
+    const writer = new FullWriter({ format: 'N3', formulas });
+    writer.addQuad(p, p, new BlankNode('f'));
+    expect(await end(writer)).toBe('<urn:p> <urn:p> { ?x <urn:p> <urn:a>. <?x> <urn:p> <urn:b>. ' +
+      '<urn:p> <urn:p> <<(?x <urn:p> <urn:a>)>>, <<(<?x> <urn:p> <urn:a>)>> }.\n');
+  });
+
+  it('should end only after the formulas were written to an asynchronous stream', async () => {
+    const p = new NamedNode('urn:p'), f = new BlankNode('f'), formulas = { f: [] };
+    for (const options of [{}, { end: false }]) {
+      const callbacks = [], events = [];
+      const stream = { write(chunk, encoding, done) { events.push('write'); done && callbacks.push(done); },
+        end(done) { events.push('end'); done(); } };
+      const writer = new FullWriter(stream, { format: 'N3', formulas, ...options });
+      writer.addQuad(p, p, f);
+      const done = jest.fn();
+      writer.end(done);
+      expect(done).not.toHaveBeenCalled();
+      callbacks.forEach(callback => callback());
+      callbacks.forEach(callback => callback());
+      expect(done).toHaveBeenCalledTimes(1);
+      expect(done.mock.calls[0][0]).toBeNull();
+      expect(events).toEqual(options.end === false ? ['write'] : ['write', 'end']);
+    }
+  });
+
+  it('should report errors of the output stream when ending', async () => {
+    const p = new NamedNode('urn:p'), f = new BlankNode('f'), formulas = { f: [] };
+    const failing = (write, endStream) => {
+      const stream = { ended: 0, write, end(done) { stream.ended++; endStream && endStream(done); } };
+      return stream;
+    };
+    // An asynchronous write error
+    let stream = failing((chunk, encoding, done) => done && done(new Error('write')));
+    let writer = new FullWriter(stream, { format: 'N3', formulas });
+    writer.addQuad(p, p, f);
+    await expect(end(writer)).rejects.toThrow('write');
+    await expect(end(writer)).rejects.toThrow('write');
+    expect(stream.ended).toBe(1);
+    // A synchronous write error
+    stream = failing(() => { throw new Error('thrown'); });
+    writer = new FullWriter(stream, { format: 'N3', formulas });
+    writer.addQuad(p, p, f);
+    expect(() => writer.end()).toThrow('thrown');
+    // An error ending the stream, thrown or passed to its callback
+    for (const endStream of [() => { throw new Error('end'); }, done => done(new Error('end')),
+      done => { done(new Error('end')); done(); }]) {
+      stream = failing((chunk, encoding, done) => done && done(), endStream);
+      writer = new FullWriter(stream, { format: 'N3', formulas });
+      writer.addQuad(p, p, f);
+      await expect(end(writer)).rejects.toThrow('end');
+      expect(stream.ended).toBe(1);
+    }
+    // Without formulas
+    stream = failing(() => {}, () => { throw new Error('end'); });
+    await expect(end(new FullWriter(stream))).rejects.toThrow('end');
+    const open = new FullWriter(failing(() => {}), { end: false });
+    expect(await end(open)).toBeUndefined();
+    // An error thrown by the callback itself
+    writer = new FullWriter({ format: 'N3', formulas });
+    writer.addQuad(p, p, f);
+    expect(() => writer.end(() => { throw new Error('callback'); })).toThrow('callback');
   });
 });

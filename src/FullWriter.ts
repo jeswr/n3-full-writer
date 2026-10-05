@@ -2,7 +2,7 @@
 // N3.js writes statements as they arrive, but a formula has to be written in full
 // where it is used, so this writer holds back statements with formulas until `end`.
 import type * as RDF from '@rdfjs/types';
-import { N3Term, N3Writer, termToId } from './n3.js';
+import { N3Term, N3Writer } from './n3.js';
 import type { EndCallback, Prefixes, WriteCallback, WriterOptions, WriterOutputStream } from './n3-internals.js';
 
 // The quads of each formula, keyed by the label of the blank node that stands for it
@@ -36,19 +36,43 @@ const LISTS_WITH_FORMULAS = 'Cannot write formulas with the lists option; write 
 // The scope of blank nodes outside formulas
 const TOP_SCOPE: Scope = {};
 
-// The class of nodes created by `blank` and `list`, which N3.js does not export
-const HelperNode = (new N3Writer().blank() as object).constructor;
+const QUOTED_TRIPLES_TOO_DEEP = 'Cannot write quoted triples nested more than 256 levels deep once formulas are in use';
+// The deepest nesting of quoted triples inside one term, as N3.js serializes these recursively
+export const MAX_QUOTED_TRIPLE_DEPTH = 256;
+// The term types of RDF/JS terms; nodes from `blank` and `list` have none
+const TERM_TYPES = new Set(['NamedNode', 'BlankNode', 'Literal', 'Variable', 'DefaultGraph', 'Quad']);
 
-// Checks whether the term is or contains a node from `blank` or `list`
-function hasHelperNode(term: RDF.Term): boolean {
-  return term instanceof HelperNode || term.termType === 'Quad' &&
-    (hasHelperNode(term.subject) || hasHelperNode(term.predicate) || hasHelperNode(term.object) ||
-     hasHelperNode(term.graph));
+// Checks that the terms are RDF/JS terms, which rejects nodes from `blank` and `list`,
+// and that their quoted triples are in the default graph and not nested too deeply
+function checkTerms(terms: RDF.Term[]) {
+  const pending: [RDF.Term, number][] = terms.map(term => [term, 0]);
+  while (pending.length) {
+    const [term, depth] = pending.pop()!;
+    if (!term || !TERM_TYPES.has(term.termType))
+      throw new Error(HELPERS_WITH_FORMULAS);
+    if (term.termType === 'Quad') {
+      if (depth >= MAX_QUOTED_TRIPLE_DEPTH)
+        throw new Error(QUOTED_TRIPLES_TOO_DEEP);
+      if (!term.graph || term.graph.termType !== 'DefaultGraph')
+        throw new Error(TERM_TYPES.has(term.graph && term.graph.termType) ? GRAPHS_WITH_FORMULAS : HELPERS_WITH_FORMULAS);
+      pending.push([term.subject, depth + 1], [term.predicate, depth + 1], [term.object, depth + 1]);
+    }
+  }
 }
-// Checks whether the term is or contains a quoted triple in a named graph
-function hasNamedGraph(term: RDF.Term): boolean {
-  return term.termType === 'Quad' && (term.graph.termType !== 'DefaultGraph' ||
-    hasNamedGraph(term.subject) || hasNamedGraph(term.predicate) || hasNamedGraph(term.object));
+
+// Builds a key that tells terms apart by type and value, also inside quoted triples,
+// which `termToId` does not (an IRI `?x` and a variable `x` share an id).
+// Quoted triples were checked to be nested at most `MAX_QUOTED_TRIPLE_DEPTH` levels deep.
+function termKey(term: RDF.Term): string {
+  switch (term.termType) {
+  case 'Quad':
+    return `[${termKey(term.subject)},${termKey(term.predicate)},${termKey(term.object)}]`;
+  case 'Literal':
+    return JSON.stringify([term.termType, term.value, term.language,
+      (term as RDF.Literal & { direction?: string }).direction || '', term.datatype.value]);
+  default:
+    return JSON.stringify([term.termType, term.value]);
+  }
 }
 // Joins strings by concatenation, which unlike `Array#join` does not copy the strings,
 // so that nested formulas are not copied at every level
@@ -68,7 +92,6 @@ export default class FullWriter extends N3Writer {
   declare private _formulaCache: Map<string, InstanceType<typeof N3Term>> | null;
   // Statements with formulas are held back until the end, to group them by formula
   declare private _formulaStatements: Statement[] | null;
-  declare private _prefixesFixed: boolean;
   // `_prefixNames` maps each prefix to the IRI it is bound to
   declare private _prefixNames?: Record<string, string>;
   // N3 scopes blank node labels to their formula, so each blank node is written in one scope only.
@@ -101,7 +124,6 @@ export default class FullWriter extends N3Writer {
     this._openFormulas = new Set();
     this._formulaCache = null;
     this._formulaStatements = formulas ? [] : null;
-    this._prefixesFixed = false;
     this._blankScopes = formulas ? new Map() : null;
     this._encodingFormulas = false;
     this._writtenFormulas = new Set();
@@ -155,7 +177,6 @@ export default class FullWriter extends N3Writer {
     if (!this._formulaStatements || !this._findFormulas([object, predicate, subject]).length)
       return false;
     this._formulaStatements.push({ subject, predicate, object });
-    this._prefixesFixed = true;
     if (done)
       done();
     return true;
@@ -167,17 +188,8 @@ export default class FullWriter extends N3Writer {
   private _checkStatement(subject: RDF.Term, predicate: RDF.Term, object: RDF.Term, graph: RDF.Term) {
     if (graph && graph.termType !== 'DefaultGraph')
       throw new Error(GRAPHS_WITH_FORMULAS);
-    this._checkTerms([subject, predicate, object]);
+    checkTerms([subject, predicate, object]);
     this._addBlankScopes(this._findBlankScopes([subject, predicate, object], TOP_SCOPE));
-  }
-
-  // ### `_checkTerms` rejects nodes from `blank` and `list`, and quoted triples in named graphs,
-  // whose blank nodes and formulas cannot be checked
-  private _checkTerms(terms: RDF.Term[]) {
-    if (terms.some(hasHelperNode))
-      throw new Error(HELPERS_WITH_FORMULAS);
-    if (terms.some(hasNamedGraph))
-      throw new Error(GRAPHS_WITH_FORMULAS);
   }
 
   // ### `_findBlankScopes` lists the blank nodes of the terms that are new to the given scope,
@@ -284,12 +296,12 @@ export default class FullWriter extends N3Writer {
       const iri = prefixes[prefix];
       bindings.push([`${prefix}:`, typeof iri === 'string' ? iri : iri.value]);
     }
-    // Formulas are written with the prefixes bound when they are serialized,
-    // so these cannot change once formulas are in use
-    if (this._prefixesFixed) {
+    // N3.js keeps writing IRIs with a prefix after it was rebound,
+    // and formulas are written at the end, so prefixes cannot be rebound once formulas are in use
+    if (this._formulas) {
       for (const [prefix, iri] of bindings) {
         if (prefix in prefixNames && prefixNames[prefix] !== iri)
-          throw new Error(`Cannot rebind prefix ${prefix} after writing statements with formulas`);
+          throw new Error(`Cannot rebind prefix ${prefix} once formulas are in use`);
       }
     }
     super.addPrefixes(prefixes, done);
@@ -319,7 +331,7 @@ export default class FullWriter extends N3Writer {
       // Quads of formulas are in the default graph, or in the graph the parser labels the formula with
       if (graph && graph.termType !== 'DefaultGraph' && graph.termType !== 'BlankNode')
         throw new Error(GRAPHS_WITH_FORMULAS);
-      this._checkTerms([subject, predicate, object]);
+      checkTerms([subject, predicate, object]);
     }
     const statements = this._encodeStatements(quads);
     // Check the blank nodes after nested formulas were written, as these record theirs
@@ -343,26 +355,26 @@ export default class FullWriter extends N3Writer {
     for (const quad of quads) {
       for (const term of [quad.subject, quad.predicate, quad.object]) {
         if (this._findFormulas([term]).length) {
-          const key = termToId(term);
+          const key = termKey(term);
           occurrences.set(key, occurrences.has(key));
         }
       }
     }
-    function isShared(term: RDF.Term) { return occurrences.get(termToId(term)) === true; }
+    function isShared(term: RDF.Term) { return occurrences.get(termKey(term)) === true; }
     for (const { subject, predicate } of quads) {
       if (isShared(predicate)) {
-        const key = termToId(predicate), subjects = verbSubjects.get(key);
-        verbSubjects.set(key, subjects === undefined ? termToId(subject) : subjects === termToId(subject) && subjects);
+        const key = termKey(predicate), subjects = verbSubjects.get(key);
+        verbSubjects.set(key, subjects === undefined ? termKey(subject) : subjects === termKey(subject) && subjects);
       }
     }
     for (const { subject, predicate, object } of quads) {
       const inverse = !isShared(subject) && (isShared(object) ||
-                      isShared(predicate) && verbSubjects.get(termToId(predicate)) === false);
-      const head = inverse ? object : subject, headKey = termToId(head);
+                      isShared(predicate) && verbSubjects.get(termKey(predicate)) === false);
+      const head = inverse ? object : subject, headKey = termKey(head);
       let statement = statements.get(headKey);
       if (!statement)
         statements.set(headKey, statement = { head, verbs: [new Map(), new Map()] });
-      const verbs = statement.verbs[inverse ? 1 : 0], verbKey = termToId(predicate);
+      const verbs = statement.verbs[inverse ? 1 : 0], verbKey = termKey(predicate);
       let verb = verbs.get(verbKey);
       if (!verb)
         verbs.set(verbKey, verb = { predicate, terms: [] });
@@ -383,35 +395,96 @@ export default class FullWriter extends N3Writer {
     return result;
   }
 
-  // ### `end` writes the statements with formulas and signals the end of the output stream
+  // ### `end` writes the statements with formulas and signals the end of the output stream.
+  // Errors go to `done`, or are thrown without it.
   end(done?: EndCallback) {
     // Report the error of an earlier end
     if (this._endError)
-      return done && done(this._endError);
+      return this._report(this._endError, done);
     // Finish a possible pending quad
     this._endStatement();
     // Write the statements with formulas, which were held back
     const formulaStatements = this._formulaStatements;
     // Stop holding back statements, also when encoding them creates formulas
     this._formulaStatements = null;
-    if (formulaStatements && formulaStatements.length) {
-      this._encodingFormulas = true;
-      try {
-        this._write(`${concat(this._encodeStatements(formulaStatements), '.\n')}.\n`);
-      }
-      catch (error) {
-        // Disallow further writing, report the same error on later ends,
-        // and close the output stream unless it should stay open
-        this._write = this._blockedWrite;
-        this._endError = error as Error;
-        if (this._endStream) {
-          try { this._outputStream.end(); }
-          catch { /* error closing stream */ }
-        }
-        return done && done(error as Error);
-      }
-      finally { this._encodingFormulas = false; }
+    if (!formulaStatements || !formulaStatements.length)
+      return this._finish(done);
+    let output;
+    this._encodingFormulas = true;
+    try {
+      output = `${concat(this._encodeStatements(formulaStatements), '.\n')}.\n`;
     }
-    super.end(done);
+    catch (error) {
+      return this._fail(error as Error, done);
+    }
+    finally { this._encodingFormulas = false; }
+    // Write the formulas, and end the stream only once they were written
+    const write = this._write;
+    this._write = this._blockedWrite;
+    let written = false;
+    try {
+      write.call(this, output, error => {
+        if (written)
+          return;
+        written = true;
+        if (error)
+          this._fail(error, done);
+        else
+          this._finish(done);
+      });
+    }
+    catch (error) {
+      if (!written) {
+        written = true;
+        this._fail(error as Error, done);
+      }
+      else
+        throw error;
+    }
+  }
+
+  // ### `_finish` disallows further writing and ends the output stream unless it should stay open
+  private _finish(done?: EndCallback) {
+    this._write = this._blockedWrite;
+    if (!this._endStream)
+      return done && done(null);
+    let ended = false;
+    try {
+      this._outputStream.end((error, result) => {
+        if (ended)
+          return;
+        ended = true;
+        if (error)
+          this._fail(error, done, false);
+        else if (done)
+          done(null, result);
+      });
+    }
+    catch (error) {
+      if (ended)
+        throw error;
+      ended = true;
+      this._fail(error as Error, done, false);
+    }
+  }
+
+  // ### `_fail` disallows further writing, reports the same error on later ends,
+  // and closes the output stream unless it should stay open
+  private _fail(error: Error, done?: EndCallback, close = true) {
+    const closing = close && this._endStream;
+    this._write = this._blockedWrite;
+    this._endError = error;
+    if (closing) {
+      try { this._outputStream.end(); }
+      catch { /* the earlier error is reported */ }
+    }
+    this._report(error, done);
+  }
+
+  // ### `_report` passes the error to `done`, or throws it without one
+  private _report(error: Error, done?: EndCallback) {
+    if (!done)
+      throw error;
+    done(error);
   }
 }
