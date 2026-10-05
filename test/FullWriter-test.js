@@ -550,4 +550,33 @@ describe('A FullWriter writing N3 formulas', () => {
     expect(() => writer.end()).toThrow('Cannot write formula _:f inside itself');
     expect(() => writer.end()).toThrow('Cannot write formula _:f inside itself');
   });
+
+  it('should report formulas that cannot be written when the output stream fails while closing', async () => {
+    const p = new NamedNode('urn:p'), f = new BlankNode('f'), message = 'Cannot write formula _:f inside itself';
+    for (const options of [{}, { end: false }]) {
+      const chunks = [];
+      const stream = {
+        ended: false,
+        write(chunk, encoding, done) {
+          if (chunk === '.\n')
+            throw new Error('write');
+          chunks.push(chunk);
+          done && done();
+        },
+        end() { stream.ended = true; throw new Error('end'); },
+      };
+      const writer = new FullWriter(stream, { format: 'N3', formulas: { f: [new Quad(p, p, f)] }, ...options });
+      writer.addQuad(p, p, p);
+      writer.addQuad(p, p, f);
+      const done = jest.fn();
+      writer.end(done);
+      expect(done).toHaveBeenCalledTimes(1);
+      expect(done).toHaveBeenCalledWith(new Error(message));
+      expect(stream.ended).toBe(options.end !== false);
+      let error;
+      writer.addQuad(p, p, p, new DefaultGraph(), e => { error = e; });
+      expect(error).toEqual(new Error('Cannot write because the writer has been closed.'));
+      expect(chunks).toEqual(['<urn:p> <urn:p> <urn:p>']);
+    }
+  });
 });

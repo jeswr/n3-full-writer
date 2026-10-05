@@ -422,8 +422,14 @@ export default class FullWriter extends N3Writer {
         output = `${concat(this._encodeStatements(formulaStatements), '.\n')}.\n`;
       }
       catch (error) {
-        // Close the writer, and report the same error on later ends
+        // Close the writer, and report the same error on later ends.
+        // Errors of the output stream while closing it would hide this error, so they are ignored.
         this._endError = error as Error;
+        try { this._endStatement(); }
+        catch { /* the error of the formulas is reported */ }
+        this._subject = null;
+        this._write = this._blockedWrite;
+        // With no statement pending, `N3.Writer#end` only ends the output stream, ignoring its errors
         super.end();
         if (done)
           return done(error as Error);
