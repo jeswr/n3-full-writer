@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+
+# Least-privilege default for GITHUB_TOKEN; jobs opt into more only where needed.
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.x
+      - run: npm ci --ignore-scripts
+      - run: npm audit --omit=dev --audit-level=moderate
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22.x, 24.x, 26.x]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - run: npm run build
+      - run: npm pack --dry-run
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.x
+      - run: npm ci --ignore-scripts
+      - run: npm run lint
+
+  summary:
+    # Summary job that can be used as a single required check in branch protection
+    if: always()
+    needs:
+      - audit
+      - test
+      - lint
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Decide whether all required jobs succeeded or failed
+        # Pinned to a commit SHA: the action lives outside the actions/* org and
+        # `release/v1` is a mutable branch ref.
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # release/v1
+        with:
+          jobs: ${{ toJSON(needs) }}
+
+  release:
+    # main publishes to `latest` (branch config in package.json "release").
+    if: ${{ github.ref == 'refs/heads/main' }}
+    needs: [ audit, test, lint ]
+    runs-on: ubuntu-latest
+    # Never run two releases at once; the newest pending run covers older commits.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+    steps:
+      # Pinned to commit SHAs: this job can write to the repository and npm.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.x
+      - run: npm ci
+      - run: npm run build
+      - name: Release
+        # Publishes through npm trusted publishing: npm exchanges this job's
+        # id-token for a short-lived token, so there is no npm token secret. The
+        # package's trusted publisher on npmjs.com must name this repository and
+        # ci.yml. Needs npm >= 11.5.1, which Node 24 ships.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          # Emit npm build provenance (SLSA) via the workflow's id-token.
+          NPM_CONFIG_PROVENANCE: true
+        # The conventionalcommits preset reads `feat!:` squash titles as
+        # breaking; the default angular preset only sees BREAKING CHANGE footers.
+        # Stay on preset v9: v10 needs conventional-changelog-writer 9, but
+        # semantic-release 25's notes generator still loads writer 8.
+        run: npx -p semantic-release@25 -p conventional-changelog-conventionalcommits@9 semantic-release
