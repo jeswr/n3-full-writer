@@ -229,6 +229,8 @@ export default class FullWriter extends N3Writer {
         const frame = frames[frames.length - 1], quads = this._formulas![frame.label];
         // Find the next nested formula that is not serialized yet
         if (!frame.nested) {
+          // Check the terms first, as finding formulas in them assumes they are well-formed
+          this._checkFormulaQuads(quads);
           const terms = [];
           for (let i = quads.length - 1; i >= 0; i--)
             terms.push(quads[i].object, quads[i].predicate, quads[i].subject);
@@ -325,14 +327,18 @@ export default class FullWriter extends N3Writer {
     return super.list(elements);
   }
 
-  // ### `_encodeFormulaQuads` serializes the quads of a formula, with its formulas already serialized
-  private _encodeFormulaQuads(quads: RDF.Quad[]) {
+  // ### `_checkFormulaQuads` checks the quads of a formula like statements
+  private _checkFormulaQuads(quads: RDF.Quad[]) {
     for (const { subject, predicate, object, graph } of quads) {
       // Quads of formulas are in the default graph, or in the graph the parser labels the formula with
       if (graph && graph.termType !== 'DefaultGraph' && graph.termType !== 'BlankNode')
         throw new Error(GRAPHS_WITH_FORMULAS);
       checkTerms([subject, predicate, object]);
     }
+  }
+
+  // ### `_encodeFormulaQuads` serializes the quads of a formula, with its formulas already serialized
+  private _encodeFormulaQuads(quads: RDF.Quad[]) {
     const statements = this._encodeStatements(quads);
     // Check the blank nodes after nested formulas were written, as these record theirs
     const scope: Scope = {}, scopes = new Map<string, Scope>();
@@ -395,96 +401,39 @@ export default class FullWriter extends N3Writer {
     return result;
   }
 
-  // ### `end` writes the statements with formulas and signals the end of the output stream.
-  // Errors go to `done`, or are thrown without it.
+  // ### `end` writes the statements with formulas and signals the end of the output stream,
+  // like `N3.Writer`. Formulas that cannot be written are reported before anything is written,
+  // to `done`, or thrown without it, and the writer is closed.
   end(done?: EndCallback) {
     // Report the error of an earlier end
-    if (this._endError)
-      return this._report(this._endError, done);
-    // Finish a possible pending quad
-    this._endStatement();
+    if (this._endError) {
+      if (done)
+        return done(this._endError);
+      throw this._endError;
+    }
     // Write the statements with formulas, which were held back
     const formulaStatements = this._formulaStatements;
     // Stop holding back statements, also when encoding them creates formulas
     this._formulaStatements = null;
-    if (!formulaStatements || !formulaStatements.length)
-      return this._finish(done);
-    let output;
-    this._encodingFormulas = true;
-    try {
-      output = `${concat(this._encodeStatements(formulaStatements), '.\n')}.\n`;
-    }
-    catch (error) {
-      return this._fail(error as Error, done);
-    }
-    finally { this._encodingFormulas = false; }
-    // Write the formulas, and end the stream only once they were written
-    const write = this._write;
-    this._write = this._blockedWrite;
-    let written = false;
-    try {
-      write.call(this, output, error => {
-        if (written)
-          return;
-        written = true;
-        if (error)
-          this._fail(error, done);
-        else
-          this._finish(done);
-      });
-    }
-    catch (error) {
-      if (!written) {
-        written = true;
-        this._fail(error as Error, done);
+    if (formulaStatements && formulaStatements.length) {
+      let output;
+      this._encodingFormulas = true;
+      try {
+        output = `${concat(this._encodeStatements(formulaStatements), '.\n')}.\n`;
       }
-      else
+      catch (error) {
+        // Close the writer, and report the same error on later ends
+        this._endError = error as Error;
+        super.end();
+        if (done)
+          return done(error as Error);
         throw error;
+      }
+      finally { this._encodingFormulas = false; }
+      // Finish a possible pending quad before the statements with formulas
+      this._endStatement();
+      this._write(output);
     }
-  }
-
-  // ### `_finish` disallows further writing and ends the output stream unless it should stay open
-  private _finish(done?: EndCallback) {
-    this._write = this._blockedWrite;
-    if (!this._endStream)
-      return done && done(null);
-    let ended = false;
-    try {
-      this._outputStream.end((error, result) => {
-        if (ended)
-          return;
-        ended = true;
-        if (error)
-          this._fail(error, done, false);
-        else if (done)
-          done(null, result);
-      });
-    }
-    catch (error) {
-      if (ended)
-        throw error;
-      ended = true;
-      this._fail(error as Error, done, false);
-    }
-  }
-
-  // ### `_fail` disallows further writing, reports the same error on later ends,
-  // and closes the output stream unless it should stay open
-  private _fail(error: Error, done?: EndCallback, close = true) {
-    const closing = close && this._endStream;
-    this._write = this._blockedWrite;
-    this._endError = error;
-    if (closing) {
-      try { this._outputStream.end(); }
-      catch { /* the earlier error is reported */ }
-    }
-    this._report(error, done);
-  }
-
-  // ### `_report` passes the error to `done`, or throws it without one
-  private _report(error: Error, done?: EndCallback) {
-    if (!done)
-      throw error;
-    done(error);
+    super.end(done);
   }
 }
